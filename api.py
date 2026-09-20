@@ -42,7 +42,7 @@ DOMAIN = os.getenv("MAIL_DOMAIN", "yourdomain.com")
 # Webhook secrets (set these in your mail service dashboard)
 MAILGUN_API_KEY = os.getenv("MAILGUN_API_KEY", "")
 POSTMARK_SECRET = os.getenv("POSTMARK_SECRET", "")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 if not DB_URL:
     raise ValueError("DATABASE_URL environment variable is required!")
@@ -324,11 +324,12 @@ async def webhook_generic(request: Request, secret: Optional[str] = None):
 @app.post("/webhook/raw")
 async def webhook_raw(request: Request, secret: Optional[str] = None):
     """Handle raw email content (ideal for Cloudflare Workers)"""
-    if secret and secret != WEBHOOK_SECRET:
-        # Also check header for secret
-        header_secret = request.headers.get("X-Secret")
-        if header_secret != WEBHOOK_SECRET:
-            raise HTTPException(401, "Invalid secret")
+    # Cloudflare sends the shared secret in X-Secret. Do not allow an
+    # unauthenticated request when WEBHOOK_SECRET is missing or malformed.
+    header_secret = request.headers.get("X-Secret", "")
+    provided_secret = secret or header_secret
+    if not WEBHOOK_SECRET or not hmac.compare_digest(provided_secret, WEBHOOK_SECRET):
+        raise HTTPException(401, "Invalid secret")
             
     import email
     from email import policy
