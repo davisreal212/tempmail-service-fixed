@@ -398,6 +398,9 @@ async def web_ui():
             .container { max-width: 900px; margin: 0 auto; }
             h1 { text-align: center; margin-bottom: 10px; background: linear-gradient(90deg, #00ff88, #00ccff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-size: 2.5em; }
             .subtitle { text-align: center; color: #888; margin-bottom: 30px; }
+            .top-links { text-align: center; margin: -15px 0 25px; }
+            .top-links a { color: #00ccff; text-decoration: none; margin: 0 10px; font-size: 0.95em; }
+            .top-links a:hover { color: #00ff88; text-decoration: underline; }
             .card { background: #121228; border: 1px solid #1e1e3f; border-radius: 16px; padding: 25px; margin-bottom: 25px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
             .email-display { background: #0a0a1a; border: 2px dashed #1e1e3f; border-radius: 12px; padding: 20px; font-size: 1.5em; color: #00ff88; text-align: center; font-weight: 700; word-break: break-all; margin: 15px 0; position: relative; }
             .timer { text-align: center; color: #ff6b6b; font-size: 0.95em; margin: 10px 0; }
@@ -437,7 +440,10 @@ async def web_ui():
         <div class="container">
             <h1>🔒 TempMail</h1>
             <p class="subtitle">Temporary email addresses that auto-expire</p>
-
+            <div class="top-links">
+                <a href="/docs">API Documentation (Swagger UI)</a>
+                <a href="/redoc">ReDoc</a>
+            </div>
             <div class="card">
                 <p style="text-align:center;color:#888;margin-bottom:10px;">Your temporary email address:</p>
                 <div class="email-display" id="email">Loading...</div>
