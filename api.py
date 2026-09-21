@@ -395,8 +395,14 @@ async def webhook_raw(request: Request, secret: Optional[str] = None):
         else:
             body_text = msg.get_content()
 
-    for content_id, data_url in inline_images.items():
-        body_html = body_html.replace(f"cid:{content_id}", data_url)
+    if body_html and inline_images:
+        def replace_cid(match):
+            content_id = match.group(1).strip("<>").lower()
+            return inline_images.get(content_id, match.group(0))
+
+        normalized_images = {key.lower(): value for key, value in inline_images.items()}
+        inline_images = normalized_images
+        body_html = re.sub(r"cid:\s*<?([^\s>'\"]+)>?", replace_cid, body_html, flags=re.IGNORECASE)
             
     await store_email(
         recipient=recipient,
@@ -656,10 +662,10 @@ async def web_ui():
                 const m = messages[idx];
                 document.getElementById('modalSubject').textContent = m.subject;
                 const htmlPart = m.body_html
-                    ? '<iframe class="html-email" sandbox referrerpolicy="no-referrer"></iframe>'
+                    ? '<iframe class="html-email" sandbox="allow-same-origin" referrerpolicy="no-referrer"></iframe>'
                     : `<div class="text-email">${esc(m.body_text || 'No content')}</div>`;
                 const attachments = (m.attachments || []).map(a => a.data_url && a.content_type && a.content_type.startsWith('image/')
-                    ? `<div class="attachment"><img src="${a.data_url}" alt="${esc(a.filename || 'Image')}" referrerpolicy="no-referrer"><span class="attachment-name">${esc(a.filename || 'Image')}</span></div>`
+                    ? `<div class="attachment"><img src="${esc(a.data_url)}" alt="${esc(a.filename || 'Image')}" referrerpolicy="no-referrer"><span class="attachment-name">${esc(a.filename || 'Image')}</span></div>`
                     : `<div class="attachment"><span class="attachment-name">📎 ${esc(a.filename || 'Attachment')} (${esc(a.content_type || 'file')})</span></div>`
                 ).join('');
                 document.getElementById('modalBody').innerHTML = `
@@ -671,7 +677,12 @@ async def web_ui():
                     ${attachments ? `<h4 style="margin-top:18px;">Attachments</h4><div class="attachment-list">${attachments}</div>` : ''}
                 `;
                 const frame = document.querySelector('#modalBody iframe');
-                if (frame) frame.srcdoc = m.body_html;
+                if (frame) {
+                    frame.srcdoc = emailDocument(m.body_html);
+                    frame.onload = () => {
+                        frame.style.height = Math.min(900, Math.max(320, frame.contentDocument.body.scrollHeight + 24)) + 'px';
+                    };
+                }
                 document.getElementById('modal').style.display = 'flex';
             }
 
@@ -689,6 +700,36 @@ async def web_ui():
                 const d = document.createElement('div');
                 d.innerHTML = html || '';
                 return d.textContent || d.innerText || '';
+            }
+
+            function emailDocument(html) {
+                const parsed = new DOMParser().parseFromString(html || '', 'text/html');
+                parsed.querySelectorAll('script, iframe, object, embed, form, input, button, textarea, select, base, link').forEach(node => node.remove());
+                parsed.querySelectorAll('*').forEach(node => {
+                    [...node.attributes].forEach(attr => {
+                        const name = attr.name.toLowerCase();
+                        const value = attr.value.trim();
+                        if (name.startsWith('on') || name === 'srcdoc' || /javascript\s*:/i.test(value)) {
+                            node.removeAttribute(attr.name);
+                        } else if ((name === 'src' || name === 'href') && value && !/^(https?:|data:image\/|mailto:|#)/i.test(value)) {
+                            node.removeAttribute(attr.name);
+                        }
+                    });
+                    if (node.tagName === 'A' && node.getAttribute('href')) {
+                        node.setAttribute('target', '_blank');
+                        node.setAttribute('rel', 'noopener noreferrer');
+                    }
+                });
+                const styles = [...parsed.querySelectorAll('style')].map(style => style.textContent || '').join('\n');
+                const content = parsed.body ? parsed.body.innerHTML : html;
+                return `<!doctype html><html><head><meta charset="utf-8"><style>
+                    ${styles}
+                    html,body { margin: 0; padding: 0; background: #fff; color: #111; }
+                    body { font-family: Arial, Helvetica, sans-serif; line-height: 1.45; overflow-wrap: anywhere; }
+                    img { max-width: 100%; height: auto; }
+                    table { max-width: 100%; }
+                    pre { white-space: pre-wrap; }
+                </style></head><body>${content}</body></html>`;
             }
 
             document.getElementById('modal').onclick = (e) => {
