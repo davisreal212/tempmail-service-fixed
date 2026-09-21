@@ -23,6 +23,7 @@ import json
 import re
 import hmac
 import hashlib
+import base64
 from datetime import datetime, timezone
 from typing import Optional, List
 from contextlib import asynccontextmanager
@@ -138,12 +139,16 @@ async def store_email(recipient: str, sender: str, subject: str, body_text: str,
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
         """, eid, recipient.lower(), sender, subject, body_text, body_html, raw, json.dumps(attachments), now, expires)
 
-    # Notify WebSocket clients
+    # Notify WebSocket clients with the complete message so the inbox can
+    # update immediately without requiring a manual refresh.
     await ws_manager.notify(recipient.lower(), {
         "type": "new_email",
         "id": eid,
         "sender": sender,
         "subject": subject,
+        "body_text": body_text,
+        "body_html": body_html,
+        "attachments": attachments,
         "body_preview": (body_text or body_html or "")[:200],
         "received_at": now,
         "expires_in": EMAIL_EXPIRY
@@ -244,13 +249,16 @@ async def ws_endpoint(ws: WebSocket, email: str):
         now = datetime.now(timezone.utc).timestamp()
         async with db_pool.acquire() as conn:
             rows = await conn.fetch("""
-                SELECT id, sender, subject, body_text, received_at, expires_at
+                SELECT id, sender, subject, body_text, body_html, attachments, received_at, expires_at
                 FROM emails WHERE recipient = $1 AND expires_at > $2 ORDER BY received_at DESC
             """, email.lower(), now)
         for r in rows:
             await ws.send_json({
                 "type": "existing", "id": str(r["id"]), "sender": r["sender"],
-                "subject": r["subject"], "body_preview": (r["body_text"] or "")[:200],
+                "subject": r["subject"], "body_text": r["body_text"],
+                "body_html": r["body_html"],
+                "attachments": json.loads(r["attachments"]) if r["attachments"] else [],
+                "body_preview": (r["body_text"] or r["body_html"] or "")[:200],
                 "received_at": r["received_at"], "expires_in": int(r["expires_at"] - now)
             })
         while True:
@@ -348,18 +356,33 @@ async def webhook_raw(request: Request, secret: Optional[str] = None):
     body_text = ""
     body_html = ""
     attachments = []
+    inline_images = {}
     
     if msg.is_multipart():
         for part in msg.walk():
             content_type = part.get_content_type()
             cd = str(part.get("Content-Disposition", ""))
-            if "attachment" in cd:
-                filename = part.get_filename()
+            payload = part.get_payload(decode=True) or b""
+            filename = part.get_filename()
+            content_id = (part.get("Content-ID") or "").strip("<>")
+            if content_type.startswith("image/") and payload:
+                data_url = f"data:{content_type};base64,{base64.b64encode(payload).decode('ascii')}"
+                if content_id:
+                    inline_images[content_id] = data_url
+                attachments.append({
+                    "filename": filename or content_id or "inline-image",
+                    "content_type": content_type,
+                    "size": len(payload),
+                    "content_id": content_id or None,
+                    "data_url": data_url,
+                })
+            elif "attachment" in cd:
                 if filename:
                     attachments.append({
                         "filename": filename,
                         "content_type": content_type,
-                        "size": len(part.get_payload(decode=True) or b"")
+                        "size": len(payload),
+                        "content_id": content_id or None,
                     })
             elif content_type == "text/plain":
                 body_text = part.get_content()
@@ -371,6 +394,9 @@ async def webhook_raw(request: Request, secret: Optional[str] = None):
             body_html = msg.get_content()
         else:
             body_text = msg.get_content()
+
+    for content_id, data_url in inline_images.items():
+        body_html = body_html.replace(f"cid:{content_id}", data_url)
             
     await store_email(
         recipient=recipient,
@@ -432,6 +458,12 @@ async def web_ui():
             .close-btn:hover { color: #fff; }
             .modal-body { color: #ccc; line-height: 1.7; }
             .modal-body pre { background: #0a0a1a; padding: 15px; border-radius: 8px; overflow-x: auto; font-size: 0.85em; }
+            .html-email { width: 100%; min-height: 260px; border: 1px solid #2b2b52; border-radius: 10px; background: #fff; margin-top: 15px; }
+            .text-email { white-space: pre-wrap; word-break: break-word; background: #0a0a1a; border-radius: 10px; padding: 15px; margin-top: 15px; }
+            .attachment-list { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 15px; }
+            .attachment { background: #0a0a1a; border: 1px solid #2b2b52; border-radius: 10px; padding: 8px; max-width: 180px; }
+            .attachment img { display: block; max-width: 160px; max-height: 120px; border-radius: 6px; object-fit: contain; background: #fff; }
+            .attachment-name { display: block; color: #aaa; font-size: 0.78em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 6px; }
             #refreshBtn { background: #1e1e3f; color: #00ff88; padding: 6px 12px; border-radius: 8px; font-size: 0.85em; border: 1px solid #1e1e3f; }
             #refreshBtn:hover { border-color: #00ff88; }
         </style>
@@ -559,9 +591,15 @@ async def web_ui():
 
                 ws.onmessage = (e) => {
                     const msg = JSON.parse(e.data);
-                    if (msg.type !== 'existing') {
+                    if (msg.type === 'new_email') {
+                        if (!messages.some(existing => existing.id === msg.id)) {
+                            messages.unshift(msg);
+                            renderMessages();
+                        }
                         showNotification(msg);
-                        loadMessages();
+                    } else if (msg.type === 'existing' && !messages.some(existing => existing.id === msg.id)) {
+                        messages.push(msg);
+                        renderMessages();
                     }
                 };
                 ws.onclose = () => {
@@ -584,39 +622,56 @@ async def web_ui():
                     const res = await fetch('/api/inbox/' + encodeURIComponent(currentEmail));
                     const data = await res.json();
                     messages = data.messages;
-                    document.getElementById('msgCount').textContent = `${data.count} message${data.count !== 1 ? 's' : ''}`;
-
-                    const container = document.getElementById('messages');
-                    if (data.count === 0) {
-                        container.innerHTML = '<div class="empty">No messages yet. Send an email to your address!</div>';
-                    } else {
-                        container.innerHTML = data.messages.map((m, i) => `
-                            <div class="message" onclick="openModal(${i})" style="cursor:pointer;">
-                                <div class="msg-header">
-                                    <span class="sender">${esc(m.sender)}</span>
-                                    <span style="color:#ff6b6b;font-size:0.8em;">⏱️ ${Math.floor(m.expires_in/60)}m ${m.expires_in%60}s</span>
-                                </div>
-                                <div class="subject">${esc(m.subject)}</div>
-                                <div class="preview">${esc(m.body_text || m.body_html || '').substring(0, 180)}${(m.body_text||m.body_html||'').length > 180 ? '...' : ''}</div>
-                            </div>
-                        `).join('');
-                    }
+                    renderMessages();
                 } catch (e) {
                     console.error(e);
                 }
                 btn.textContent = '🔄 Refresh';
             }
 
+            function renderMessages() {
+                document.getElementById('msgCount').textContent = `${messages.length} message${messages.length !== 1 ? 's' : ''}`;
+                const container = document.getElementById('messages');
+                if (!messages.length) {
+                    container.innerHTML = '<div class="empty">No messages yet. Send an email to your address!</div>';
+                    return;
+                }
+                container.innerHTML = messages.map((m, i) => {
+                    const previewSource = m.body_text || stripHtml(m.body_html || '') || 'No preview available';
+                    const imageCount = (m.attachments || []).filter(a => a.content_type && a.content_type.startsWith('image/')).length;
+                    return `
+                        <div class="message" onclick="openModal(${i})" style="cursor:pointer;">
+                            <div class="msg-header">
+                                <span class="sender">${esc(m.sender || 'Unknown')}</span>
+                                <span style="color:#ff6b6b;font-size:0.8em;">⏱️ ${Math.floor(m.expires_in/60)}m ${m.expires_in%60}s</span>
+                            </div>
+                            <div class="subject">${esc(m.subject || 'No Subject')}</div>
+                            <div class="preview">${esc(previewSource).substring(0, 180)}${previewSource.length > 180 ? '...' : ''}${imageCount ? ` · 🖼️ ${imageCount} image${imageCount > 1 ? 's' : ''}` : ''}</div>
+                        </div>
+                    `;
+                }).join('');
+            }
+
             function openModal(idx) {
                 const m = messages[idx];
                 document.getElementById('modalSubject').textContent = m.subject;
+                const htmlPart = m.body_html
+                    ? '<iframe class="html-email" sandbox referrerpolicy="no-referrer"></iframe>'
+                    : `<div class="text-email">${esc(m.body_text || 'No content')}</div>`;
+                const attachments = (m.attachments || []).map(a => a.data_url && a.content_type && a.content_type.startsWith('image/')
+                    ? `<div class="attachment"><img src="${a.data_url}" alt="${esc(a.filename || 'Image')}" referrerpolicy="no-referrer"><span class="attachment-name">${esc(a.filename || 'Image')}</span></div>`
+                    : `<div class="attachment"><span class="attachment-name">📎 ${esc(a.filename || 'Attachment')} (${esc(a.content_type || 'file')})</span></div>`
+                ).join('');
                 document.getElementById('modalBody').innerHTML = `
                     <p><strong>From:</strong> ${esc(m.sender)}</p>
                     <p><strong>Received:</strong> ${new Date(m.received_at * 1000).toLocaleString()}</p>
                     <p><strong>Expires in:</strong> ${Math.floor(m.expires_in/60)}m ${m.expires_in%60}s</p>
                     <hr style="border-color:#333;margin:15px 0;">
-                    <div style="white-space:pre-wrap;word-break:break-word;">${esc(m.body_text || m.body_html || 'No content')}</div>
+                    ${htmlPart}
+                    ${attachments ? `<h4 style="margin-top:18px;">Attachments</h4><div class="attachment-list">${attachments}</div>` : ''}
                 `;
+                const frame = document.querySelector('#modalBody iframe');
+                if (frame) frame.srcdoc = m.body_html;
                 document.getElementById('modal').style.display = 'flex';
             }
 
@@ -628,6 +683,12 @@ async def web_ui():
                 const d = document.createElement('div');
                 d.textContent = t || '';
                 return d.innerHTML;
+            }
+
+            function stripHtml(html) {
+                const d = document.createElement('div');
+                d.innerHTML = html || '';
+                return d.textContent || d.innerText || '';
             }
 
             document.getElementById('modal').onclick = (e) => {
