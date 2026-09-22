@@ -271,6 +271,7 @@ async def ws_endpoint(ws: WebSocket, email: str):
         ws_manager.disconnect(ws, email.lower())
 
 # ==================== WEBHOOK ENDPOINTS ====================
+MAX_ATTACHMENT_BYTES = 12 * 1024 * 1024
 
 @app.post("/webhook/mailgun")
 async def webhook_mailgun(request: Request):
@@ -365,25 +366,22 @@ async def webhook_raw(request: Request, secret: Optional[str] = None):
             payload = part.get_payload(decode=True) or b""
             filename = part.get_filename()
             content_id = (part.get("Content-ID") or "").strip("<>")
-            if content_type.startswith("image/") and payload:
-                data_url = f"data:{content_type};base64,{base64.b64encode(payload).decode('ascii')}"
-                if content_id:
-                    inline_images[content_id] = data_url
-                attachments.append({
-                    "filename": filename or content_id or "inline-image",
+            is_attachment = bool(filename or "attachment" in cd.lower() or content_type.startswith("image/"))
+            if is_attachment and payload:
+                item = {
+                    "filename": filename or content_id or "attachment",
                     "content_type": content_type,
                     "size": len(payload),
                     "content_id": content_id or None,
-                    "data_url": data_url,
-                })
-            elif "attachment" in cd:
-                if filename:
-                    attachments.append({
-                        "filename": filename,
-                        "content_type": content_type,
-                        "size": len(payload),
-                        "content_id": content_id or None,
-                    })
+                }
+                if len(payload) <= MAX_ATTACHMENT_BYTES:
+                    data_url = f"data:{content_type};base64,{base64.b64encode(payload).decode('ascii')}"
+                    item["data_url"] = data_url
+                    if content_id:
+                        inline_images[content_id] = data_url
+                else:
+                    item["too_large"] = True
+                attachments.append(item)
             elif content_type == "text/plain":
                 body_text = part.get_content()
             elif content_type == "text/html":
@@ -469,6 +467,8 @@ async def web_ui():
             .attachment-list { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 15px; }
             .attachment { background: #0a0a1a; border: 1px solid #2b2b52; border-radius: 10px; padding: 8px; max-width: 180px; }
             .attachment img { display: block; max-width: 160px; max-height: 120px; border-radius: 6px; object-fit: contain; background: #fff; }
+            .file-download { display: block; color: #00ccff; text-decoration: none; font-weight: 600; padding: 12px 6px; }
+            .file-download:hover { color: #00ff88; text-decoration: underline; }
             .attachment-name { display: block; color: #aaa; font-size: 0.78em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 6px; }
             #refreshBtn { background: #1e1e3f; color: #00ff88; padding: 6px 12px; border-radius: 8px; font-size: 0.85em; border: 1px solid #1e1e3f; }
             #refreshBtn:hover { border-color: #00ff88; }
@@ -523,32 +523,54 @@ async def web_ui():
             let currentEmail = null, ws = null, expiryTime = null, timerInterval = null, messages = [];
 
             async function init() {
-                const saved = localStorage.getItem('tempmail_data');
-                if (saved) {
-                    const data = JSON.parse(saved);
-                    // Check if still valid (roughly)
-                    if (Date.now() < data.saved_at + (data.expires_in * 1000)) {
-                        setEmail(data, false);
-                        return;
+                try {
+                    const saved = localStorage.getItem('tempmail_data');
+                    if (saved) {
+                        const data = JSON.parse(saved);
+                        if (data.email && Date.now() < data.saved_at + (data.expires_in * 1000)) {
+                            setEmail(data, false);
+                            return;
+                        }
+                        localStorage.removeItem('tempmail_data');
                     }
+                    await generateEmail(false);
+                } catch (e) {
+                    console.error('Mailbox initialization failed', e);
+                    showGenerationError();
                 }
-                generateEmail(false);
             }
 
             async function generateEmail(force = true) {
                 document.getElementById('status').textContent = 'Generating...';
-                const res = await fetch('/api/generate');
-                const data = await res.json();
-                setEmail(data, true);
+                try {
+                    const res = await fetch('/api/generate');
+                    if (!res.ok) throw new Error(`Generator returned ${res.status}`);
+                    const data = await res.json();
+                    setEmail(data, true);
+                } catch (e) {
+                    console.error('Address generation failed', e);
+                    showGenerationError();
+                }
             }
 
             async function generateCustom() {
                 const custom = document.getElementById('customInput').value.trim();
                 if (!custom) return;
                 document.getElementById('status').textContent = 'Generating...';
-                const res = await fetch('/api/generate/' + encodeURIComponent(custom));
-                const data = await res.json();
-                setEmail(data, true);
+                try {
+                    const res = await fetch('/api/generate/' + encodeURIComponent(custom));
+                    if (!res.ok) throw new Error(`Generator returned ${res.status}`);
+                    const data = await res.json();
+                    setEmail(data, true);
+                } catch (e) {
+                    console.error('Custom address generation failed', e);
+                    showGenerationError();
+                }
+            }
+
+            function showGenerationError() {
+                document.getElementById('email').textContent = 'Unavailable';
+                document.getElementById('status').textContent = '⚠️ Could not create an address. Tap New Random to retry.';
             }
 
             function setEmail(data, save = true) {
@@ -665,8 +687,10 @@ async def web_ui():
                     ? '<iframe class="html-email" sandbox="allow-same-origin" referrerpolicy="no-referrer"></iframe>'
                     : `<div class="text-email">${esc(m.body_text || 'No content')}</div>`;
                 const attachments = (m.attachments || []).map(a => a.data_url && a.content_type && a.content_type.startsWith('image/')
-                    ? `<div class="attachment"><img src="${esc(a.data_url)}" alt="${esc(a.filename || 'Image')}" referrerpolicy="no-referrer"><span class="attachment-name">${esc(a.filename || 'Image')}</span></div>`
-                    : `<div class="attachment"><span class="attachment-name">📎 ${esc(a.filename || 'Attachment')} (${esc(a.content_type || 'file')})</span></div>`
+                    ? `<div class="attachment"><a href="${esc(a.data_url)}" download="${esc(a.filename || 'image')}"><img src="${esc(a.data_url)}" alt="${esc(a.filename || 'Image')}" referrerpolicy="no-referrer"></a><span class="attachment-name">${esc(a.filename || 'Image')}</span></div>`
+                    : a.data_url
+                        ? `<div class="attachment"><a class="file-download" href="${esc(a.data_url)}" download="${esc(a.filename || 'attachment')}">📎 Download ${esc(a.filename || 'Attachment')}</a><span class="attachment-name">${esc(a.content_type || 'file')} · ${formatBytes(a.size)}</span></div>`
+                        : `<div class="attachment"><span class="attachment-name">📎 ${esc(a.filename || 'Attachment')} (${esc(a.content_type || 'file')})${a.too_large ? ' · too large to preview' : ''}</span></div>`
                 ).join('');
                 document.getElementById('modalBody').innerHTML = `
                     <p><strong>From:</strong> ${esc(m.sender)}</p>
@@ -702,6 +726,13 @@ async def web_ui():
                 return d.textContent || d.innerText || '';
             }
 
+            function formatBytes(bytes) {
+                if (!bytes) return '0 B';
+                const units = ['B', 'KB', 'MB', 'GB'];
+                const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+                return `${(bytes / Math.pow(1024, i)).toFixed(i ? 1 : 0)} ${units[i]}`;
+            }
+
             function emailDocument(html) {
                 const parsed = new DOMParser().parseFromString(html || '', 'text/html');
                 parsed.querySelectorAll('script, iframe, object, embed, form, input, button, textarea, select, base, link').forEach(node => node.remove());
@@ -709,9 +740,9 @@ async def web_ui():
                     [...node.attributes].forEach(attr => {
                         const name = attr.name.toLowerCase();
                         const value = attr.value.trim();
-                        if (name.startsWith('on') || name === 'srcdoc' || /javascript\s*:/i.test(value)) {
+                        if (name.startsWith('on') || name === 'srcdoc' || /javascript\\s*:/i.test(value)) {
                             node.removeAttribute(attr.name);
-                        } else if ((name === 'src' || name === 'href') && value && !/^(https?:|data:image\/|mailto:|#)/i.test(value)) {
+                        } else if ((name === 'src' || name === 'href') && value && !/^(https?:|data:image\\/|mailto:|#)/i.test(value)) {
                             node.removeAttribute(attr.name);
                         }
                     });
@@ -720,7 +751,7 @@ async def web_ui():
                         node.setAttribute('rel', 'noopener noreferrer');
                     }
                 });
-                const styles = [...parsed.querySelectorAll('style')].map(style => style.textContent || '').join('\n');
+                const styles = [...parsed.querySelectorAll('style')].map(style => style.textContent || '').join('\\n');
                 const content = parsed.body ? parsed.body.innerHTML : html;
                 return `<!doctype html><html><head><meta charset="utf-8"><style>
                     ${styles}
